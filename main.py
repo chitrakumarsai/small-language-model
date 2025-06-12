@@ -11,9 +11,12 @@ from dataclasses import dataclass
 import numpy as np
 from tqdm.auto import tqdm
 from contextlib import nullcontext
+import matplotlib.pyplot as plt
 import os
-
+# Training Config
+ds = load_dataset("roneneldan/TinyStories")
 enc = tiktoken.get_encoding("gpt2")
+from torch.optim.lr_scheduler import LinearLR,SequentialLR, CosineAnnealingLR
 
 # Some functions from https://github.com/karpathy/nanoGPT/blob/master/data/openwebtext/prepare.py
 
@@ -118,6 +121,7 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
 
+# This is a single transformer block, which consists of a self-attention layer and an MLP.
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -206,3 +210,130 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
+config = GPTConfig(
+    vocab_size=50257,     # use the tokenizer's vocab size
+    block_size=128,       # or whatever context size you're training with
+    n_layer=6,
+    n_head=6,
+    n_embd=384,
+    dropout=0.1,
+    bias=True
+)
+
+model = GPT(config)
+
+def estimate_loss(model):
+    out = {}
+    model.eval()
+    with torch.inference_mode():
+        for split in ['train', 'val']:
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = get_batch(split)
+                with ctx:
+                    logits, loss = model(X, Y)
+                losses[k] = loss.item()
+            out[split] = losses.mean()
+    model.train()
+    return out
+
+
+
+learning_rate = 1e-4 #more stable training, earlier 1e-4
+max_iters = 20000 #increase from 25000
+warmup_steps = 1000 #smoother initial train, earlier 100
+min_lr = 5e-4 #lower rate, earlier 5e-4
+eval_iters = 500 # increased from 100
+batch_size = 32 # changed from 16, better gradient estimate
+block_size = 128 #changed from 64, capture longer range dependencies
+
+gradient_accumulation_steps = 32 # reduced from 50
+
+device =  "cuda" if torch.cuda.is_available() else "cpu"
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+# note: float16 data type will automatically use a GradScaler
+
+# How to use autocast https://wandb.ai/wandb_fc/tips/reports/How-To-Use-Autocast-in-PyTorch--VmlldzoyMTk4NTky
+#dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+
+ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+torch.set_default_device(device)
+torch.manual_seed(42)
+
+##PUT IN WEIGHT DECAY, CHANGED BETA2 to 0.95
+optimizer =  torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.1, eps=1e-9) #weight decay for regularization
+
+scheduler_warmup = LinearLR(optimizer, total_iters = warmup_steps) #Implement linear warmup
+scheduler_decay = CosineAnnealingLR(optimizer,T_max = max_iters - warmup_steps, eta_min = min_lr) #Implement lr decay
+scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_decay], milestones=[warmup_steps]) #Switching from warmup to decay
+
+# https://stackoverflow.com/questions/72534859/is-gradscaler-necessary-with-mixed-precision-training-with-pytorch
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+
+best_val_loss = float('inf')
+best_model_params_path = "best_model_params.pt"
+train_loss_list, validation_loss_list = [], []
+
+# Ensure model is on the correct device
+model = model.to(device)
+
+# In your training loop
+for epoch in tqdm(range(max_iters)):
+    if epoch % eval_iters == 0 and epoch != 0:
+        # Ensure estimate_loss uses the correct device
+        losses = estimate_loss(model)
+        print(f"Epoch {epoch}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"The current learning rate: {optimizer.param_groups[0]['lr']:.5f}")
+        train_loss_list += [losses['train']]
+        validation_loss_list += [losses['val']]
+
+        if losses['val'] < best_val_loss:
+            best_val_loss = losses['val']
+            torch.save(model.state_dict(), best_model_params_path)
+
+    # Ensure X and y are on the correct device
+    X, y = get_batch("train")
+    X, y = X.to(device), y.to(device)
+
+    with ctx:
+        logits, loss = model(X, y)
+        loss = loss / gradient_accumulation_steps
+        scaler.scale(loss).backward()
+
+    if ((epoch + 1) % gradient_accumulation_steps == 0) or (epoch + 1 == max_iters):
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+    scheduler.step()
+
+
+train_loss_list_converted = [i.cpu().detach() for i in train_loss_list]
+validation_loss_list_converted = [i.cpu().detach() for i in validation_loss_list]
+
+plt.plot(train_loss_list_converted, 'g', label='train_loss')
+plt.plot(validation_loss_list_converted, 'r', label='validation_loss')
+plt.xlabel("Steps - Every 100 epochs")
+plt.ylabel("Loss")
+plt.legend()
+plt.show()
+
+
+#Load the model
+model = GPT(config)  # re-create the model with same config
+device =  "cuda" if torch.cuda.is_available() else "cpu"
+best_model_params_path = "best_model_params.pt"
+model.load_state_dict(torch.load(best_model_params_path, map_location=torch.device(device))) # load best model states
+
+sentence = "Once upon a time there was a pumpkin."
+context = (torch.tensor(enc.encode_ordinary(sentence)).unsqueeze(dim = 0))
+y = model.generate(context, 200)
+print(enc.decode(y.squeeze().tolist()))
+
+sentence = "A little girl went to the woods"
+context = (torch.tensor(enc.encode_ordinary(sentence)).unsqueeze(dim = 0))
+y = model.generate(context, 200)
+print(enc.decode(y.squeeze().tolist()))
