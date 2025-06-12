@@ -1,4 +1,3 @@
-# small-language-model
 # Small Language Model Implementation
 
 A PyTorch implementation of a GPT-style language model trained on the TinyStories dataset. This project implements a small transformer-based language model with the following key features:
