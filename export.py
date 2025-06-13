@@ -21,7 +21,7 @@ dummy_input = torch.randint(0, config.vocab_size, (1, config.block_size), dtype=
 
 # TorchScript
 traced = torch.jit.trace(model, dummy_input)
-traced.save("best_model.pt")
+traced.save("best_model.pt") # type: ignore
 
 # ONNX
 torch.onnx.export(

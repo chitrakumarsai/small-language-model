@@ -138,7 +138,7 @@ class CausalSelfAttention(nn.Module):
         # Apply linear projection and split into query, key, value tensors
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
-        # Reshape each into (batch, heads, seq_len, head_dim)
+        # Reshape each into (batch_size, n_head, seq_len, head_dim)
         k = k.view(batch_size, seq_len, self.n_head, n_embd // self.n_head).transpose(1, 2)
         q = q.view(batch_size, seq_len, self.n_head, n_embd // self.n_head).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.n_head, n_embd // self.n_head).transpose(1, 2)
@@ -268,7 +268,7 @@ class GPT(nn.Module):
     def generate(self, input_ids, max_new_tokens, temperature=1.0, top_k=None):
         """
         Generate tokens given a conditioning sequence.
-        input_ids: Tensor of shape (B, T) containing token ids
+        input_ids: Tensor of shape (batch_size, seq_len) containing token ids
         """
         # Loop for each new token to generate
         for _ in range(max_new_tokens):
